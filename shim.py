@@ -1,18 +1,5 @@
 """
-Bazarr <-> whisper.cpp shim
-
-Mimics the SubGen API that Bazarr expects:
-  GET  /                                            -> version string (SubGen format)
-  GET  /status                                      -> same
-  GET  /health                                      -> health check
-  POST /detect-language?encode=false                -> language detection
-  POST //detect-language?encode=false               -> same (Bazarr double-slash variant)
-  POST /asr?task=transcribe&language=en&output=srt  -> transcription
-  POST //asr?task=transcribe&language=en&output=srt -> same (Bazarr double-slash variant)
-
-When encode=false, Bazarr sends the video file PATH as the audio_file field value,
-not actual audio bytes. We pass that path directly to ffmpeg.
-When encode=true (or absent), Bazarr uploads the actual audio bytes.
+Bazarr <-> whisper.cpp shim (SubGen-compatible API)
 """
 
 import os
@@ -31,8 +18,6 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 WHISPER_URL = os.environ.get("WHISPER_INTERNAL_URL", "http://127.0.0.1:8080")
-
-# Must match SubGen's version string format so Bazarr can parse it
 VERSION = "Subgen 1.0.0, stable-ts 0.0.0, faster-whisper 0.0.0 (whisper-cpp-vulkan)"
 
 LANG_NAMES = {
@@ -47,24 +32,16 @@ LANG_NAMES = {
 
 
 def convert_to_wav(source, duration_limit=None):
-    """
-    Convert audio/video to 16kHz mono WAV.
-    source: either a file path string, or raw bytes.
-    Returns path to a temp WAV file.
-    """
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_wav = tmp.name
 
     cmd = ["ffmpeg", "-y"]
-
-    if isinstance(source, (str, bytes)) and not isinstance(source, bytes):
-        # It's a file path - pass directly
-        log.info(f"ffmpeg reading from path: {source}")
+    if isinstance(source, str):
+        log.info(f"ffmpeg: reading from path: {source}")
         cmd += ["-i", source]
         input_bytes = None
     else:
-        # It's raw bytes - pipe via stdin
-        log.info("ffmpeg reading from pipe (uploaded bytes)")
+        log.info(f"ffmpeg: reading {len(source)} bytes from pipe")
         cmd += ["-i", "pipe:0"]
         input_bytes = source
 
@@ -80,32 +57,44 @@ def convert_to_wav(source, duration_limit=None):
     return tmp_wav
 
 
-def get_audio_source(request_files, request_form, encode_param):
+def get_audio_source(req_files, req_form, encode_param):
     """
-    When encode=false, Bazarr sends the file path as a form field value (not an upload).
-    When encode=true or absent, it uploads the actual audio bytes.
-    Returns either a path string or bytes.
+    Debug version - logs everything Bazarr sends so we can see exactly what arrives.
     """
-    encode = encode_param.lower() if encode_param else "true"
+    encode = (encode_param or "true").lower()
 
-    if encode == "false":
-        # Check if it's a plain text path in the form field
-        if "audio_file" in request_form:
-            path = request_form.get("audio_file").strip()
-            if path:
-                log.info(f"encode=false, using file path: {path}")
-                return path
-        # Otherwise Bazarr pre-extracted and uploaded the audio as bytes — just use them
+    # Log all incoming fields
+    log.info(f"encode param = {encode!r}")
+    log.info(f"form keys: {list(req_form.keys())}")
+    log.info(f"files keys: {list(req_files.keys())}")
 
-    # encode=true: actual file upload
-    audio_file = request_files.get("audio_file")
-    if not audio_file:
-        return None
-    return audio_file.read()
+    for k in req_form:
+        v = req_form.get(k, "")
+        log.info(f"  form[{k!r}] = {repr(v[:300])}")
+
+    for k in req_files:
+        f = req_files[k]
+        data = f.read(64)
+        f.seek(0)
+        log.info(f"  files[{k!r}] filename={f.filename!r} content_type={f.content_type!r} first64={data.hex()}")
+
+    # Try form field path first
+    if "audio_file" in req_form:
+        path = req_form.get("audio_file", "").strip()
+        if path and not path.startswith('\x00'):
+            log.info(f"Using form path: {path!r}")
+            return path
+
+    # Fall back to file upload bytes
+    if "audio_file" in req_files:
+        data = req_files["audio_file"].read()
+        log.info(f"Using uploaded bytes: {len(data)} bytes")
+        return data
+
+    return None
 
 
 def call_whisper_inference(wav_path, response_format="verbose_json", language=None, translate=False):
-    """POST a WAV file to whisper-server /inference. Returns requests.Response."""
     with open(wav_path, "rb") as f:
         form = {
             "file": (os.path.basename(wav_path), f, "audio/wav"),
@@ -117,7 +106,6 @@ def call_whisper_inference(wav_path, response_format="verbose_json", language=No
             form["language"] = (None, language)
         if translate:
             form["translate"] = (None, "true")
-
         return requests.post(f"{WHISPER_URL}/inference", files=form, timeout=600)
 
 
@@ -128,7 +116,6 @@ def call_whisper_inference(wav_path, response_format="verbose_json", language=No
 @app.route("/", methods=["GET"])
 @app.route("/status", methods=["GET"])
 def index():
-    """Bazarr parses this for the version string. Must match SubGen format."""
     return jsonify({"version": VERSION})
 
 
@@ -144,7 +131,7 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Language detection - Bazarr calls this BEFORE /asr
+# Language detection
 # ---------------------------------------------------------------------------
 
 @app.route("/detect-language", methods=["POST"])
@@ -157,33 +144,25 @@ def detect_language():
 
     tmp_wav = None
     try:
-        log.info("detect-language: converting audio (first 30s)")
         tmp_wav = convert_to_wav(source, duration_limit=30)
-
         r = call_whisper_inference(tmp_wav, response_format="verbose_json")
-
         if r.status_code != 200:
-            log.error(f"whisper-server error {r.status_code}: {r.text[:200]}")
             return f"whisper-server error: {r.text}", r.status_code
-
         data = r.json()
         lang_code = data.get("language", "en")
         lang_name = LANG_NAMES.get(lang_code, lang_code)
-
-        log.info(f"detect-language result: {lang_name} ({lang_code})")
+        log.info(f"detect-language: {lang_name} ({lang_code})")
         return jsonify({"detected_language": lang_name, "language_code": lang_code})
-
     except Exception as e:
         log.exception(f"detect-language error: {e}")
         return f"Internal error: {e}", 500
-
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
             os.unlink(tmp_wav)
 
 
 # ---------------------------------------------------------------------------
-# Main transcription endpoint
+# Transcription
 # ---------------------------------------------------------------------------
 
 @app.route("/asr", methods=["POST"])
@@ -204,33 +183,22 @@ def asr():
 
     tmp_wav = None
     try:
-        log.info(f"asr: converting audio (format={response_format}, lang={language}, task={task}, encode={encode_param})")
+        log.info(f"asr: format={response_format} lang={language} task={task} encode={encode_param}")
         tmp_wav = convert_to_wav(source)
-
-        r = call_whisper_inference(
-            tmp_wav,
-            response_format=response_format,
-            language=language,
-            translate=translate
-        )
-
-        log.info(f"whisper-server responded: HTTP {r.status_code}, {len(r.content)} bytes")
-
+        r = call_whisper_inference(tmp_wav, response_format=response_format,
+                                   language=language, translate=translate)
+        log.info(f"whisper-server: HTTP {r.status_code}, {len(r.content)} bytes")
         if r.status_code != 200:
             log.error(f"whisper-server error: {r.text[:500]}")
             return f"whisper-server error: {r.text}", r.status_code
-
         content_type = r.headers.get("Content-Type", "text/plain; charset=utf-8")
         return Response(r.content, status=200, content_type=content_type)
-
     except requests.exceptions.Timeout:
         log.error("Timed out waiting for whisper-server")
         return "Transcription timed out", 504
-
     except Exception as e:
         log.exception(f"asr error: {e}")
         return f"Internal error: {e}", 500
-
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
             os.unlink(tmp_wav)
