@@ -89,18 +89,13 @@ def get_audio_source(request_files, request_form, encode_param):
     encode = encode_param.lower() if encode_param else "true"
 
     if encode == "false":
-        # Bazarr sends the path as the value of audio_file form field
-        path = None
+        # Check if it's a plain text path in the form field
         if "audio_file" in request_form:
             path = request_form.get("audio_file").strip()
-        elif "audio_file" in request_files:
-            # Sometimes it still comes as a file upload but with path as content
-            path = request_files["audio_file"].read().decode("utf-8").strip()
-
-        if path:
-            log.info(f"encode=false, using file path: {path}")
-            return path
-        log.warning("encode=false but no path found, falling back to bytes")
+            if path:
+                log.info(f"encode=false, using file path: {path}")
+                return path
+        # Otherwise Bazarr pre-extracted and uploaded the audio as bytes — just use them
 
     # encode=true: actual file upload
     audio_file = request_files.get("audio_file")
