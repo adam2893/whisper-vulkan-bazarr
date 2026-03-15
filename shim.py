@@ -1,17 +1,13 @@
 """
 Bazarr <-> whisper.cpp shim (SubGen-compatible API)
 
-Confirmed Bazarr behaviour (from Bazarr whisperai.py source):
-1. Bazarr runs ffmpeg locally to encode audio stream to WAV
-2. POSTs that WAV to POST /detect-language?encode=false
-3. POSTs that WAV to POST /asr?task=transcribe&language=en&output=srt&encode=false
-
-So we receive a real WAV file and forward it directly to whisper-server /inference.
-No re-encoding needed.
+Bazarr sends raw 16kHz mono int16 PCM (no WAV header, first bytes = ffffffff).
+We wrap it in a WAV header before forwarding to whisper-server.
 """
 
 import io
 import os
+import wave
 import logging
 import requests
 from flask import Flask, request, Response, jsonify
@@ -23,13 +19,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# Bazarr sends full episode WAV audio - disable Flask's content length limit
-# (default 16MB would silently corrupt large uploads)
-app.config['MAX_CONTENT_LENGTH'] = None
+app.config['MAX_CONTENT_LENGTH'] = None  # No limit - full episode audio can be 100MB+
 
 WHISPER_URL = os.environ.get("WHISPER_INTERNAL_URL", "http://127.0.0.1:8080")
 VERSION = "Subgen 1.0.0, stable-ts 0.0.0, faster-whisper 0.0.0 (whisper-cpp-vulkan)"
+SAMPLE_RATE = 16000
 
 LANG_NAMES = {
     "en": "english", "fr": "french", "de": "german", "es": "spanish",
@@ -42,11 +36,34 @@ LANG_NAMES = {
 }
 
 
-def call_whisper(audio_bytes, filename, response_format="verbose_json",
-                 language=None, translate=False):
-    """POST audio bytes to whisper-server /inference."""
+def to_wav(pcm_bytes):
+    """Wrap raw int16 16kHz mono PCM bytes in a WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)      # int16 = 2 bytes per sample
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm_bytes)
+    buf.seek(0)
+    return buf
+
+
+def is_wav(data):
+    return data[:4] == b'RIFF' and data[8:12] == b'WAVE'
+
+
+def prepare_audio(data):
+    """Return a BytesIO WAV buffer ready for whisper-server."""
+    if is_wav(data):
+        log.info("Audio is already WAV")
+        return io.BytesIO(data)
+    log.info("Audio is raw PCM, wrapping in WAV header")
+    return to_wav(data)
+
+
+def call_whisper(wav_buf, response_format="verbose_json", language=None, translate=False):
     form = {
-        "file": (filename, io.BytesIO(audio_bytes), "audio/wav"),
+        "file": ("audio.wav", wav_buf, "audio/wav"),
         "response_format": (None, response_format),
         "temperature": (None, "0.0"),
         "temperature_inc": (None, "0.2"),
@@ -58,14 +75,13 @@ def call_whisper(audio_bytes, filename, response_format="verbose_json",
     return requests.post(f"{WHISPER_URL}/inference", files=form, timeout=600)
 
 
-def get_audio_bytes(req_files):
-    """Read audio_file from request. Returns (bytes, filename) or (None, None)."""
+def get_audio(req_files):
     f = req_files.get("audio_file")
     if not f:
-        return None, None
+        return None
     data = f.read()
-    log.info(f"Received audio_file: {len(data)} bytes, first4={data[:4].hex() if data else 'empty'}")
-    return data, f.filename or "audio.wav"
+    log.info(f"Received {len(data)} bytes, first4={data[:4].hex() if data else 'empty'}")
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +91,6 @@ def get_audio_bytes(req_files):
 @app.route("/", methods=["GET"])
 @app.route("/status", methods=["GET"])
 def index():
-    """Bazarr checks this for the version string."""
     return jsonify({"version": VERSION})
 
 
@@ -91,26 +106,24 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Language detection - Bazarr calls this before /asr
+# Language detection
 # ---------------------------------------------------------------------------
 
 @app.route("/detect-language", methods=["POST"])
 @app.route("//detect-language", methods=["POST"])
 def detect_language():
-    data, filename = get_audio_bytes(request.files)
+    data = get_audio(request.files)
     if not data:
         return "No audio_file provided", 400
 
     try:
-        # Only send first 30 seconds worth of audio for speed
-        # WAV header is 44 bytes, 16kHz mono int16 = 32000 bytes/sec
-        # 30s = 960000 bytes of PCM + 44 byte header
-        THIRTY_SEC_BYTES = 44 + (16000 * 2 * 30)
-        trimmed = data[:THIRTY_SEC_BYTES] if len(data) > THIRTY_SEC_BYTES else data
+        # Trim to first 30 seconds for speed: 30s * 16000hz * 2 bytes = 960000 bytes
+        trimmed = data[:960000] if not is_wav(data) else data
+        wav_buf = prepare_audio(trimmed)
 
-        r = call_whisper(trimmed, filename, response_format="verbose_json")
+        r = call_whisper(wav_buf, response_format="verbose_json")
         if r.status_code != 200:
-            log.error(f"whisper-server error {r.status_code}: {r.text[:300]}")
+            log.error(f"whisper-server {r.status_code}: {r.text[:300]}")
             return f"whisper-server error: {r.text}", r.status_code
 
         lang_code = r.json().get("language", "en")
@@ -134,7 +147,7 @@ def asr():
     language = request.args.get("language", "auto")
     output   = request.args.get("output", "srt")
 
-    data, filename = get_audio_bytes(request.files)
+    data = get_audio(request.files)
     if not data:
         return "No audio_file provided", 400
 
@@ -143,10 +156,12 @@ def asr():
     translate = (task == "translate")
 
     try:
-        log.info(f"asr: format={response_format} lang={language} task={task} size={len(data)}bytes")
-        r = call_whisper(data, filename, response_format=response_format,
+        log.info(f"asr: format={response_format} lang={language} task={task} size={len(data)}b")
+        wav_buf = prepare_audio(data)
+
+        r = call_whisper(wav_buf, response_format=response_format,
                          language=language, translate=translate)
-        log.info(f"whisper-server: HTTP {r.status_code}, {len(r.content)} bytes back")
+        log.info(f"whisper-server: HTTP {r.status_code}, {len(r.content)} bytes")
 
         if r.status_code != 200:
             log.error(f"whisper-server error: {r.text[:500]}")

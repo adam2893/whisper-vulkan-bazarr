@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     glslc \
     python3 \
     python3-pip \
+    ffmpeg \
     curl \
     && pip3 install flask requests --break-system-packages \
     && apt-get clean \
